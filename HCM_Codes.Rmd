@@ -1,0 +1,1909 @@
+---
+title: "donizete-analise-tcc"
+output:
+  pdf_document: default
+  word_document: default
+date: "2024-10-11"
+---
+
+#Starting program + Data loading
+
+```{r}
+FILE_NAME = "C:/Users/leolv/Downloads/cmh_atual.csv"
+
+library(dplyr)
+library(janitor)
+library(gtsummary)
+library(flextable)
+library(officer)
+library(kableExtra)
+library(flextable)
+library(tibble)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(stringr)
+library(readr)
+library(forcats)
+library(reshape2)
+library(pROC)
+
+df2 <- readr::read_csv(FILE_NAME) %>%
+  janitor::clean_names() %>%
+  mutate(idade = as.integer(idade),
+         data_da_consulta = lubridate::dmy(data_da_consulta)) %>%
+  mutate(
+    diametro_da_parede_posterior = as.numeric(diametro_da_parede_posterior),
+    velocidade_de_refluxo_da_tricuspide = as.numeric(velocidade_de_refluxo_da_tricuspide),
+    septo = as.numeric(septo),
+    # HOTFIX: `septo` seems to be filled in cm instead of mm.
+    septo = ifelse(septo < 6.0, septo * 10, septo),
+    relacao_sistole_diastole_ress = diametro_sistolico_do_ve_ressonancia / diametro_diastolico_do_ve_ressonancia
+  ) %>%
+  mutate(across(where(~ is.character(.) & n_distinct(.) <= 8), ~ factor(.))) %>%
+  mutate(
+    confirmacao_cmh = fct_case_when(
+      hipertrofia_do_ve == "Sim" | eco_repouso_positivo == "Sim" |
+      ressonancia_positiva_para_cmp == "Sim" | hipertrofia_ressonancia == "Sim" ~ "Sim",
+      is.na(hipertrofia_do_ve) & is.na(eco_repouso_positivo) & 
+      is.na(ressonancia_positiva_para_cmp) & is.na(hipertrofia_ressonancia) ~ NA_character_,
+      TRUE ~ "Não"
+    ),
+    septo_ress = case_when(
+      !is.na(parede_inferoseptal) & !is.na(parede_anteroseptal) ~ pmax(parede_inferoseptal, parede_anteroseptal),
+      !is.na(parede_inferoseptal) ~ parede_inferoseptal,
+      !is.na(parede_anteroseptal) ~ parede_anteroseptal,
+      TRUE ~ NA_real_
+    ),
+    septo_geral = case_when(
+      !is.na(septo_ress) & !is.na(septo) ~ pmax(septo_ress, septo),
+      !is.na(septo_ress) ~ septo_ress,
+      !is.na(septo) ~ septo,
+      TRUE ~ NA_real_
+    ),
+    fe_geral = case_when(
+      !is.na(fracao_de_ejecao_do_ve_ressonancia) ~ fracao_de_ejecao_do_ve_ressonancia,
+      !is.na(fracao_de_ejecao) ~ fracao_de_ejecao,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  mutate(
+    vus_clean = case_when(
+      is.na(vus) ~ NA_character_,
+      grepl("negativo", tolower(vus), fixed = TRUE) ~ NA_character_,
+      TRUE ~ vus
+    ),
+    vus_count = case_when(
+      !is.na(vus_clean) ~ str_count(vus_clean, "[,;.]") + 1,
+      TRUE ~ 0
+    )
+  ) %>%
+  mutate(
+    tem_ecg = fct_case_when(is.na(ritmo_sinusal) & is.na(fibrilacao_atrial) & is.na(strain) ~ "Não",
+                             TRUE ~ "Sim"),
+    tem_eco_rep = fct_case_when(is.na(septo) ~ "Não",
+                                 TRUE ~ "Sim"),
+    tem_eco_est = fct_case_when(is.na(eco_estresse_positivo) ~ "Não",
+                                 TRUE ~ "Sim"),
+    tem_ress = fct_case_when(is.na(septo_ress) ~ "Não",
+                             TRUE ~ "Sim"),
+    tem_holter = fct_case_when(is.na(positividade_do_holter) ~ "Não",
+                                TRUE ~ "Sim"),
+    tem_cat = fct_case_when(is.na(positividade_do_cateterismo) ~ "Não",
+                            TRUE ~ "Sim")
+  ) %>%
+  mutate(
+    obstrucao_de_vsve = case_when(
+      is.na(gradiente_maximo) ~ NA_character_,
+      gradiente_maximo >= 30 ~ "Sim",
+      TRUE ~ "Não"
+    ) %>% as_factor()
+  ) %>%
+  mutate(
+     gradiente_maximo_total = pmax(
+     gradiente_maximo_ve_ao,
+     gradiente_maximo,
+     gradiente_maximo_ressonancia,
+     gradiente_novo,
+    na.rm = TRUE  # Ignora NA ao calcular o máximo
+    ) 
+  ) %>%
+  mutate(
+    obstrucao_atualizado = case_when(
+      is.na(obstrucao_novo) & is.na(gradiente_maximo_total) ~ NA_character_,  # Retorna NA se ambos forem NA
+      obstrucao_novo == "Sim" | gradiente_maximo_total >= 30 ~ "Sim",         # Mantém lógica existente para "Sim"
+      TRUE ~ "Não"                                                            # Caso contrário, retorna "Não"
+    ) %>% as_factor()
+  )
+  mutate(dx_genetico = case_when(
+    is.na(gene_number_1) ~ "Negativo",
+    TRUE ~ "Positivo"
+  ), 
+  dx_genetico = factor(dx_genetico),
+  genetic_dx_type = case_when(
+    gene_number_1 %in% c("ACTC1","FLNC", "LAMP2", "MYL2","MYL3", "DES", "JPH2", "PLN",
+                           "TNNC1","TPM1", "PRKAG2", "CSRP3", "MYH7", "MYBPC3", "TNNI3",
+                           "TTN", "CSRP3", "TNNT2", "ALPK3", "AGL", "ALMS1", "DSP",
+                           "SLC22AS", "TMEM70") ~ "True HCM",
+    gene_number_1 %in% c("TTR", "GLA", "PTPN11", "RAF1") ~ "Phenocopy",
+    vus_count > 0 ~ "VUS",
+    TRUE ~ "Negativos"
+   # TRUE ~ NA_character_
+  ),
+  genetic_dx_type = factor(genetic_dx_type),
+  true_genetic_hcm = fct_case_when(genetic_dx_type == "True HCM" ~ "HCM Genética", TRUE ~ "HCM Não Genética"),
+  data_da_consulta = lubridate::as_date(data_da_consulta),
+  is_new = data_da_consulta > lubridate::as_date('2023-01-01')) %>%
+  mutate(is_sus = fct_case_when(
+    convenio == "SUS" ~ "SUS",
+    TRUE ~ "Particular"
+  )) %>%
+  mutate(origin = case_when(
+    grepl("aracaju", tolower(procedencia), fixed = TRUE) ~ "Capital",
+    TRUE ~ "Interior"
+  ) %>% as_factor()) %>%
+  mutate(
+    genetic_group = case_when(
+      dx_genetico == 'Positivo' ~ 'Genética Positiva',
+      vus_count > 0 & dx_genetico == 'Negativo' ~ 'VUS',
+      vus_count == 0 & dx_genetico == 'Negativo' ~ 'Genética Negativa'  
+    ) %>% as_factor()
+  )
+
+readr::write_csv(df2, stringr::str_interp("${FILE_NAME}_processed.csv"))
+
+df2
+
+```
+
+```{r}
+df2 <- readr::read_csv(FILE_NAME) %>%
+  janitor::clean_names() %>%
+  mutate(
+    dx_genetico = case_when(
+      is.na(gene_number_1) ~ "Negativo",
+      TRUE ~ "Positivo"
+    ), 
+    dx_genetico = factor(dx_genetico),
+    genetic_dx_type = case_when(
+      gene_number_1 %in% c("ACTC1","FLNC", "LAMP2", "MYL2","MYL3", "DES", "JPH2", "PLN",
+                           "TNNC1","TPM1", "PRKAG2", "CSRP3", "MYH7", "MYBPC3", "TNNI3",
+                           "TTN", "CSRP3", "TNNT2", "ALPK3", "AGL", "ALMS1", "DSP",
+                           "SLC22AS", "TMEM70") ~ "True HCM",
+      gene_number_1 %in% c("TTR", "PTPN11","GLA", "RAF1") ~ "Phenocopy",
+      TRUE ~ NA_character_
+    ),
+    genetic_dx_type = factor(genetic_dx_type),
+    true_genetic_hcm = fct_case_when(genetic_dx_type == "True HCM" ~ "HCM Genética", TRUE ~ "HCM Não Genética"),
+    data_da_consulta = lubridate::as_date(data_da_consulta),
+    is_new = data_da_consulta > lubridate::as_date('2023-01-01')
+  ) %>%
+  mutate(
+    is_sus = fct_case_when(
+      convenio == "SUS" ~ "SUS",
+      TRUE ~ "Particular"
+    ),
+    origin = case_when(
+      grepl("aracaju", tolower(procedencia), fixed = TRUE) ~ "Capital",
+      TRUE ~ "Interior"
+    ) %>% as_factor(),
+    genetic_group = case_when(
+      dx_genetico == 'Positivo' ~ 'Genética Positiva',
+      vus_count > 0 & dx_genetico == 'Negativo' ~ 'VUS',
+      vus_count == 0 & dx_genetico == 'Negativo' ~ 'Genética Negativa'
+    ) %>% as_factor(),
+    imc = peso / ((altura / 100) ^ 2), # Cálculo do IMC
+    imc_strat = case_when(
+      imc < 18.5 ~ "Baixo peso",
+      imc >= 18.5 & imc <= 24.9 ~ "Eutrófico",
+      imc >= 25 & imc <= 29.9 ~ "Sobrepeso",
+      imc >= 30 & imc <= 34.9 ~ "Obesidade grau 1",
+      imc >= 35 & imc <= 39.9 ~ "Obesidade grau 2",
+      imc > 40 ~ "Obesidade extrema",
+      TRUE ~ NA_character_
+    ) %>% as_factor() # Estratificação do IMC
+  )
+
+readr::write_csv(df2, stringr::str_interp("${FILE_NAME}_processed.csv"))
+
+df2
+```
+
+#Tabela 1
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(janitor)
+library(kableExtra)
+library(flextable)
+library(tibble)
+
+# Calcular frequências absolutas e relativas, considerando apenas as classes desejadas
+tabela_frequencias <- df2 %>%
+  filter(!is.na(gene_group) & gene_group %in% c("MYH7", "MYBPC3", "Outros")) %>%  # Filtra NAs e mantém apenas as classes desejadas
+  group_by(gene_group) %>%
+  summarise(
+    Frequencia_Absoluta = n()  # Contagem de frequência absoluta
+  ) %>%
+  ungroup()
+
+# Calcular o total de frequências absolutas para os três grupos
+total_classes <- sum(tabela_frequencias$Frequencia_Absoluta)
+
+# Calcular a frequência relativa em relação ao total das classes
+tabela_frequencias <- tabela_frequencias %>%
+  mutate(Frequencia_Relativa = round(Frequencia_Absoluta / total_classes * 100, 1)) %>%
+  mutate(Frequencia_Relativa = paste(Frequencia_Relativa, "%", sep = ""))  # Formatação da frequência relativa
+
+# Exibir a tabela com kable
+tabela_frequencias %>%
+  kable("html", col.names = c("Gene Group", "Frequência Absoluta", "Frequência Relativa")) %>%
+  kable_styling(latex_options = c("striped", "scale_down"), full_width = F)
+```
+
+######################################################################################################################### 
+
+######################################################################################################################### 
+
+######################################################################################################################### 
+
+######################################################################################################################### 
+
+#variáveis !!!
+
+```{r}
+cmh_nova <- cmh_data %>%
+  
+
+  
+cmh_data <- cmh_data %>%
+  mutate(
+  genetic_dx_type = case_when(
+    gene_number_1 %in% c("ACTC1","FLNC", "LAMP2", "MYL2","MYL3", "DES", "JPH2", "PLN",
+                           "TNNC1","TPM1", "PRKAG2", "CSRP3", "MYH7", "MYBPC3", "TNNI3",
+                           "TTN", "CSRP3", "TNNT2", "ALPK3", "AGL", "ALMS1", "DSP",
+                           "SLC22AS", "TMEM70") ~ "Sarcomeric",
+    gene_number_1 %in% c("TTR", "GLA", "PTPN11") ~ "Phenocopy",
+    vus_count > 0 ~ "VUS",
+    TRUE ~ "Non genetic"
+   # TRUE ~ NA_character_
+    )
+  )
+
+df2 <- df2 %>%
+  mutate(
+    new_gene_dx = case_when(
+      gene_number_1 %in% c("ACTC1", "FLNC", "LAMP2", "MYL2", "TNNI3", "CSRP3", 
+                           "MYBPC3", "MYL3", "TNNT2", "DES", "JPH2", "MYH7", 
+                           "PLN", "TNNC1", "TPM1", "GLA", "TTR", "LAMP2", "PTPN11") ~ "GEN POSITIVO", 
+      TRUE ~ "GEN NEGATIVO"
+    )
+  )  
+
+cmh_data <- cmh_data %>%
+  mutate(
+    new_gene_dx = case_when(
+      gene_number_1 %in% c("ACTC1", "FLNC", "LAMP2", "MYL2", "TNNI3", "CSRP3", 
+                           "MYBPC3", "MYL3", "TNNT2", "DES", "JPH2", "MYH7", 
+                           "PLN", "TNNC1", "TPM1", "GLA", "TTR", "LAMP2", "PTPN11") ~ "GEN POSITIVO", 
+      TRUE ~ "GEN NEGATIVO"
+    )
+  )  
+
+
+df2 <- df2 %>%
+  mutate(
+    is_ttr = case_when(
+      gene_number_1 %in% c("TTR") ~ "TTR", 
+      gene_number_1 %in% c("ACTC1", "FLNC", "LAMP2", "MYL2", "TNNI3", "CSRP3", 
+                           "MYBPC3", "MYL3", "TNNT2", "DES", "JPH2", "MYH7", 
+                           "PLN", "TNNC1", "TPM1", "GLA", "LAMP2", "PTPN11") ~ "DEMAIS GENES", 
+      TRUE ~ "GEN NEGATIVO"
+    )
+  )  
+
+cmh_data <- cmh_data %>%
+  mutate(
+    is_ttr = case_when(
+      gene_number_1 %in% c("TTR") ~ "TTR", 
+      gene_number_1 %in% c("ACTC1", "FLNC", "LAMP2", "MYL2", "TNNI3", "CSRP3", 
+                           "MYBPC3", "MYL3", "TNNT2", "DES", "JPH2", "MYH7", 
+                           "PLN", "TNNC1", "TPM1", "GLA", "LAMP2", "PTPN11") ~ "DEMAIS GENES", 
+      TRUE ~ "GEN NEGATIVO"
+    )
+  )  
+
+
+cmh_data <- cmh_data %>%
+ mutate(
+    imc = peso / ((altura / 100) ^ 2), # Cálculo do IMC
+    imc_strat = case_when(
+      imc < 18.5 ~ "Baixo peso",
+      imc >= 18.5 & imc <= 24.9 ~ "Eutrófico",
+      imc >= 25 & imc <= 29.9 ~ "Sobrepeso",
+      imc >= 30 & imc <= 34.9 ~ "Obesidade grau 1",
+      imc >= 35 & imc <= 39.9 ~ "Obesidade grau 2",
+      imc > 40 ~ "Obesidade extrema",
+      TRUE ~ NA_character_
+    ) %>% as_factor() # Estratificação do IMC
+  )
+
+cmh_newdata <- cmh_data %>%
+  mutate(
+    gene_group = case_when(
+      genetic_group == "Genética Positiva" & gene_number_1 == "MYH7" ~ "MYH7",
+      genetic_group == "Genética Positiva" & gene_number_1 == "MYBPC3" ~ "MYBPC3",
+      genetic_group == "Genética Positiva" ~ "Outros Genes",
+      genetic_group == "Genética Negativa" ~ "Genética Negativa",
+      genetic_group == "VUS" ~ "VUS"
+    ) %>% as_factor(),
+    origin = case_when(
+      grepl("aracaju", tolower(procedencia), fixed = TRUE) ~ "Capital",
+      TRUE ~ "Interior"
+    ) %>% as_factor()
+  )
+
+
+cmh_data <- cmh_data %>%
+  mutate(
+    new_vus = case_when(
+      new_gene_dx == 'GEN POSITIVO' ~ 'Genética Positiva',
+      vus_count > 0 & new_gene_dx == 'GEN NEGATIVO' ~ 'VUS',
+      vus_count == 0 & new_gene_dx == 'GEN NEGATIVO' ~ 'Genética Negativa'  
+    ) %>% as_factor()
+  )
+
+df2 <- df2 %>%
+  mutate(
+    new_vus = case_when(
+      new_gene_dx == 'GEN POSITIVO' ~ 'Genética Positiva',
+      vus_count > 0 & new_gene_dx == 'GEN NEGATIVO' ~ 'VUS',
+      vus_count == 0 & new_gene_dx == 'GEN NEGATIVO' ~ 'Genética Negativa'  
+    ) %>% as_factor()
+  )
+
+#WILLIAN
+cmh_data <- cmh_data %>%
+  mutate(
+    vus_willian = case_when(
+      vus_count > 0 & new_gene_dx == 'GEN POSITIVO' ~ 'P/LP COM VUS',
+      vus_count == 0 & new_gene_dx == 'GEN POSITIVO' ~ 'P/LP SEM VUS',
+      vus_count > 0 & new_gene_dx == 'GEN NEGATIVO' ~ 'APENAS VUS',
+      vus_count == 0 & new_gene_dx == 'GEN NEGATIVO' ~ 'ALL NEG'  
+    ) %>% as_factor()
+  )
+
+df2 <- df2 %>%
+  mutate(
+    vus_willian = case_when(
+      vus_count > 0 & new_gene_dx == 'GEN POSITIVO' ~ 'P/LP COM VUS',
+      vus_count == 0 & new_gene_dx == 'GEN POSITIVO' ~ 'P/LP SEM VUS',
+      vus_count > 0 & new_gene_dx == 'GEN NEGATIVO' ~ 'APENAS VUS',
+      vus_count == 0 & new_gene_dx == 'GEN NEGATIVO' ~ 'ALL NEG'  
+    ) %>% as_factor()
+  )
+
+
+df2 <- df2 %>%
+  mutate(
+  ttr_novo = case_when(
+    gene_number_1 %in% c("ACTC1","FLNC", "LAMP2", "MYL2","MYL3", "DES", "JPH2", "PLN",
+                           "TNNC1","TPM1", "PRKAG2", "CSRP3", "MYH7", "MYBPC3", "TNNI3",
+                           "CSRP3", "TNNT2") ~ "SARCOMERIC",
+    gene_number_1 %in% c("TTR") ~ "TTR",
+    vus_count > 0 ~ "VUS",
+    TRUE ~ "GEN NEG"
+   # TRUE ~ NA_character_
+    )
+  )
+
+
+#DIRETRIZ
+cmh_data <- cmh_data %>%
+  mutate(
+    dx_diretriz = case_when(
+        septo_geral >= 13  ~ 'NA DIRETRIZ',
+        TRUE ~ "EXTRA"
+    ) %>% as_factor()
+  )
+
+table(cmh_data$dx_diretriz)
+```
+
+```{r}
+
+cmh_data %>%
+  mutate(genetic_group = fct_relevel(genetic_group, "Genética Positiva","VUS", "Genética Negativa")) %>%
+  select(hipertensao_arterial_sistemica, diabetes, dislipidemia, portador_de_cdi, hipotireoidismo, insuficiencia_cardiaca, insuficiencia_renal, genetic_group) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `Genetic Group`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing = "no") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+
+
+
+cmh_data %>%
+ # filter(genetic_group != "VUS") %>%
+  mutate(genetic_group = fct_relevel(genetic_group, "Genética Positiva", "VUS", "Genética Negativa")) %>%
+  select(consaguinidade_parental,historico_de_morte_subita, genetic_group) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `Genetic Group`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing = "no") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+
+
+cmh_data %>%
+  mutate(genetic_dx_type = fct_relevel(genetic_dx_type, "Sarcomeric", "Phenocopy", "VUS", "Non genetic")) %>%
+  select(hipertensao_arterial_sistemica, diabetes, dislipidemia, portador_de_cdi, hipotireoidismo, insuficiencia_cardiaca, insuficiencia_renal, genetic_dx_type) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `Genetic Dx Type`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing = "no") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+
+###############################
+
+cmh_data %>%
+  select(consaguinidade_parental : acroparestesias, new_gene_dx) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `New Gene Dx`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing = "no") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+
+
+
+```
+
+#DEMOGRAFIA - NOVA
+
+```{r}
+
+cmh_data %>%
+  select(idade, sexo, imc, imc_strat, new_gene_dx) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `New Gene Dx`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing = "no") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+
+cmh_data %>%
+  select(idade, new_gene_dx) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `New Gene Dx`,
+                         statistic = list(
+                           all_continuous() ~ "{mean} ({sd})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing = "no") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+
+```
+
+#SINAIS E SINTOMAS - NOVA
+
+```{r}
+
+cmh_data %>%
+  select(palpitacao, cornea_vertissilata, angioqueratomas, dispneia, sincope, precordialgia, acroparestesias, new_gene_dx) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `New Gene Dx`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing = "no") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+
+
+
+
+```
+
+#COMORBIDADES - NOVA
+
+```{r}
+
+cmh_data %>%
+  select(hipertensao_arterial_sistemica, diabetes, dislipidemia, portador_de_cdi, hipotireoidismo, insuficiencia_cardiaca, insuficiencia_renal, new_gene_dx) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `New Gene Dx`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing = "no") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+
+
+
+```
+
+#MEDICAMENTOS - NOVA
+
+```{r}
+
+cmh_data %>%
+  select(betabloqueador, ieca_ou_bra, estatina, amiodarona, diuretico, aas, new_gene_dx) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `New Gene Dx`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing = "no") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+
+
+```
+
+#HÁBITOS - NOVA 
+
+```{r}
+
+cmh_data %>%
+  select(sedentarismo, tabagismo, alcoolismo, new_gene_dx) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `New Gene Dx`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing = "no") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+
+
+```
+
+#HISTORICO FAMILIAR - NOVA
+
+```{r}
+
+cmh_data %>%
+  select(consaguinidade_parental, historico_de_morte_subita, new_gene_dx) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `New Gene Dx`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing = "no") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+
+
+```
+
+#SEPTO - NOVA
+
+```{r}
+
+cmh_data %>%
+  select(septo_geral, fracao_de_ejecao, diametro_diastolico_do_ventriculo_esquerdo, diametro_do_atrio_esquerdo, new_gene_dx) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `New Gene Dx`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing = "no") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+
+
+```
+
+#GERAL - NOVA
+
+```{r}
+
+cmh_data %>%
+  filter(new_gene_dx %in% c("GEN POSITIVO", "GEN NEGATIVO")) %>%
+  mutate(new_gene_dx = fct_relevel(new_gene_dx, "GEN POSITIVO", "GEN NEGATIVO")) %>%
+  select(idade, sexo, origin, renda, is_sus, palpitacao, cornea_vertissilata, angioqueratomas, dispneia, sincope, precordialgia, acroparestesias, hipertensao_arterial_sistemica, diabetes, dislipidemia, portador_de_cdi, hipotireoidismo, insuficiencia_cardiaca, insuficiencia_renal, betabloqueador, ieca_ou_bra, estatina, amiodarona, diuretico, aas, sedentarismo, tabagismo, alcoolismo, consaguinidade_parental, historico_de_morte_subita, septo_geral, fracao_de_ejecao, diametro_diastolico_do_ventriculo_esquerdo, diametro_do_atrio_esquerdo, new_gene_dx) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `New Gene Dx`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing = "no") %>%
+  add_overall() %>%
+  #add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+
+
+```
+
+#GERAL - CRITÉRIO
+
+```{r}
+
+cmh_data %>%
+  #filter(new_gene_dx %in% c("GEN POSITIVO", "GEN NEGATIVO")) %>%
+ # mutate(new_gene_dx = fct_relevel(new_gene_dx, "GEN POSITIVO", "GEN NEGATIVO")) %>%
+  select(idade, sexo, origin, renda, is_sus, palpitacao, cornea_vertissilata, angioqueratomas, dispneia, sincope, precordialgia, acroparestesias, hipertensao_arterial_sistemica, diabetes, dislipidemia, portador_de_cdi, hipotireoidismo, insuficiencia_cardiaca, insuficiencia_renal, betabloqueador, ieca_ou_bra, estatina, amiodarona, diuretico, aas, sedentarismo, tabagismo, alcoolismo, consaguinidade_parental, historico_de_morte_subita, septo_geral, fracao_de_ejecao, diametro_diastolico_do_ventriculo_esquerdo, diametro_do_atrio_esquerdo, dx_diretriz) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `Dx Diretriz`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing = "no") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+
+
+```
+
+#VUS GERAL
+
+```{r}
+
+cmh_data %>%
+  filter(new_vus %in% c("Genética Positiva", "Genética Negativa")) %>%
+  mutate(new_vus = fct_relevel(new_vus, "Genética Positiva", "Genética Negativa")) %>%
+  select(idade, sexo, palpitacao, cornea_vertissilata, angioqueratomas, dispneia, sincope, precordialgia, acroparestesias, hipertensao_arterial_sistemica, diabetes, dislipidemia, portador_de_cdi, hipotireoidismo, insuficiencia_cardiaca, insuficiencia_renal, betabloqueador, ieca_ou_bra, estatina, amiodarona, diuretico, aas, sedentarismo, tabagismo, alcoolismo, consaguinidade_parental, historico_de_morte_subita, septo_geral, fracao_de_ejecao, diametro_diastolico_do_ventriculo_esquerdo, diametro_do_atrio_esquerdo, new_vus) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `New Vus`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing = "no") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+
+
+```
+
+
+# WILLIAN
+
+```{r}
+
+
+
+cmh_data %>%
+  filter(vus_willian %in% c("P/LP COM VUS", "P/LP SEM VUS")) %>%
+  mutate(vus_willian = fct_relevel(vus_willian, "P/LP COM VUS", "P/LP SEM VUS")) %>%
+  select(idade, sexo, origin, renda, is_sus, palpitacao, cornea_vertissilata, angioqueratomas, dispneia, sincope, precordialgia, acroparestesias, hipertensao_arterial_sistemica, diabetes, dislipidemia, portador_de_cdi, hipotireoidismo, insuficiencia_cardiaca, insuficiencia_renal, betabloqueador, ieca_ou_bra, estatina, amiodarona, diuretico, aas, sedentarismo, tabagismo, alcoolismo, consaguinidade_parental, historico_de_morte_subita, septo_geral, fracao_de_ejecao, diametro_diastolico_do_ventriculo_esquerdo, diametro_do_atrio_esquerdo, vus_willian) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `Vus Willian`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing = "no") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+
+
+```
+
+
+#FREQUENCIA GENES
+
+```{r}
+
+library(ggplot2)
+library(dplyr)
+
+# Criação e salvamento do gráfico dentro do pipeline
+cmh_data %>%
+  filter(new_gene_dx == "GEN POSITIVO") %>%
+  ggplot(aes(y = gene_number_1)) +
+  geom_bar(aes(x = ..prop.., group = 1), fill = "darkorange", width = 0.65) + # Gráfico de barras horizontais e laranja
+  geom_text(
+    stat = "count",
+    aes(label = ..count.., x = ..count../sum(..count..)), # Adiciona rótulos de valores absolutos
+    hjust = -0.5 # Posiciona os rótulos à esquerda das barras
+  ) +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1), # Mostra frequências relativas em porcentagem
+    expand = expansion(mult = c(0, 0.2)) # Adiciona 20% de margem superior
+  ) +
+  labs(
+    title = "Distribuição dos genes com variantes P/LP",
+    x = "Frequência Relativa (%)",
+    y = "Genes (n)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(angle = 0, hjust = 0.5), # Ajusta as legendas do eixo Y
+    axis.title.x = element_text(margin = margin(b = 25)), # Aumenta o espaçamento inferior do título do eixo X
+    axis.title.y = element_text(margin = margin(r = 25)), # Aumenta o espaçamento direito do título do eixo Y
+    axis.text.x = element_text(margin = margin(t = 15)), # Aumenta o espaçamento entre o eixo X e o gráfico
+    plot.title = element_text(hjust = 0.5, margin = margin(b = 20)), # Centralizar e adicionar margem inferior ao título
+    plot.margin = margin(t = 30, r = 10, b = 40, l = 10) # Aumentar a margem superior e inferior para evitar corte
+  ) -> plot
+
+# Salvar o gráfico como JPG
+ggsave("grafico_genes_variantes.jpg", plot = plot, device = "jpeg", width = 10, height = 7, units = "in", dpi = 300)
+
+
+
+
+```
+
+#DEMOGRAFIA
+
+```{r}
+  
+cmh_data %>%
+  mutate(
+    is_ttr = case_when(
+      gene_number_1 %in% c("MYH7", "MYBPC3", "TNNI3", "CSRP3", "TNNT2", "ALPK3", "AGL", "ALMS1", "DSP", "SLC22AS", "TMEM70") ~ "Sarcomericos",
+      gene_number_1 %in% c("TTR") ~ "TTR",
+      TRUE ~ NA_character_
+    ),
+    is_ttr = factor(is_ttr)
+  ) %>%
+  mutate(is_ttr = fct_relevel(is_ttr, "Sarcomericos", "TTR")) %>%
+  select(idade, septo_geral, is_ttr) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `Is Ttr`, 
+                         statistic = list(
+                           all_continuous() ~ "{mean} ({sd})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing_text = "Desconhecido") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped", "scale_down"))
+```
+
+#SINAIS E SINTOMAS
+
+```{r}
+df2 %>%
+  mutate(genetic_group = fct_relevel(genetic_group, "Genética Positiva", "VUS", "Genética Negativa")) %>%
+  select(palpitacao, transtornos_gastrointestinais, dispneia, sincope, precordialgia, hipoacusia, acroparestesias,
+         angioqueratomas, cornea_vertissilata, genetic_group) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `Genetic Group`,
+                         statistic = list(
+                           all_continuous() ~ "{mean} ({sd})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing_text = "Desconhecido") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+```
+
+#BUSCA COUNT
+
+```{r}
+cmh_data %>%
+  filter(!is.na(eletrocardiograma)) %>%
+  count()
+```
+
+#GENÉTICA
+
+```{r}
+df2 %>%
+  # Reorganizando os níveis de genetic_group para a ordem desejada
+  mutate(genetic_group = fct_relevel(genetic_group, "Genética Positiva", "VUS", "Genética Negativa")) %>%
+  select(septo_geral, septo_ress, septo, genetic_group) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `Genetic Group`,
+                         statistic = list(
+                           all_continuous() ~ "{mean} ({sd})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing_text = "Desconhecido") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+```
+
+#Tabela 3
+
+```{r}
+df2 %>%
+  select(probando, historico_de_morte_subita, septo_geral, gene_group) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `Gene Group`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         #sort = everything() ~ "alphanumeric",
+                         missing_text = "Desconhecido") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx(.) %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped", "scale_down"))
+```
+
+#Tabela 4 (Anamnese)
+
+```{r}
+library(dplyr)
+library(janitor)
+library(gtsummary)
+library(flextable)
+library(officer)
+
+# Criação da tabela com gtsummary
+tabela_resumo <- df2 %>%
+  select(septo_geral, obstrucao_de_vsve, genetic_group) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `Genetic Group`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing_text = "Desconhecido") %>%
+  add_overall() %>%
+  add_p()
+
+# Converter a tabela gtsummary em uma flextable para ajustar o layout no Word
+tabela_flex <- as_flex_table(tabela_resumo)
+
+# Ajustar a largura das colunas para caber no documento
+tabela_flex <- tabela_flex %>%
+  autofit() %>%
+  set_table_properties(width = 1, layout = "autofit")  # Ajusta a tabela para a página
+
+# Salvar a tabela em um documento Word
+doc <- read_docx() %>%
+  body_add_flextable(tabela_flex)
+
+print(doc, target = "tabela_obstrucao.docx")
+
+
+```
+
+```{r grafico_sintomas_mybpc3, echo=FALSE}
+
+```
+
+7
+#GRÁFICO LV WALL
+```{r}
+p_septum_genetic <- cmh_data %>%
+  select(nome_do_paciente, septo_geral, new_gene_dx) %>%
+  melt(id.vars = c("nome_do_paciente", "new_gene_dx")) %>%
+  drop_na(value) %>%
+  ggplot() +
+  geom_density(aes(x = value, fill = new_gene_dx), alpha = 0.65, color = "black", color = NA) +
+  geom_vline(aes(color = "corte_diagnostico", xintercept = 13.0), size = 0.8, linetype = "dashed", show.legend = TRUE) +
+  scale_fill_manual(
+    values = c("#183663", "#901C22"),
+    labels = c("Negative Genotype", "Positive Genotype")  # New labels
+  ) +
+  labs(
+    x = "Diameter (mm)", 
+    y = "", 
+    fill = "Genetic Group", 
+    color = "", 
+    title = "LV Wall Thickness by Genetic Group", 
+    subtitle = ""
+  ) +
+  scale_color_manual(
+    labels = c("Diagnostic Cutoff (13mm)"), 
+    values = c("darkgray")
+  ) +
+  guides(
+    fill = guide_legend(order = 1), 
+    color = guide_legend(order = 2)
+  ) +
+  scale_x_continuous(limits = c(-0.5, 45)) +
+  theme(
+    axis.line.x.bottom = element_line(color = "black"),
+    axis.line.y.left = element_line(color = "black")
+  )
+
+# Optionally, save the plot if needed
+ggsave("septum_imaging.png", plot = p_septum_genetic, dpi = 300, width = 10, height = 8)
+
+
+p_septum_genetic <- cmh_data %>%
+  filter(genetic_group %in% c("Genética Positiva", "Genética Negativa", "VUS")) %>%
+  select(nome_do_paciente, septo_geral, genetic_group) %>%
+  melt(id.vars = c("nome_do_paciente", "genetic_group")) %>%
+  drop_na(value) %>%
+  ggplot() +
+  geom_histogram(aes(x = value, fill = genetic_group), bins = 30, position = "identity", alpha = 0.65, color = NA) +
+  geom_vline(aes(color = "corte_diagnostico", xintercept = 15.0), size = 0.8, linetype = "dashed", show.legend = TRUE) +
+  scale_fill_discrete(labels = c("Genética Positiva", "Genética Negativa", "VUS")) +
+  labs(x = "Diâmetro (mm)", y = "Frequência", fill = "Grupo Genético", color = "", title = "Frequência de LV Wall Thickness por Grupo Genético") +
+  scale_color_manual(labels = c("Corte Diagnóstico (15 mm)"), values = c("darkgray")) +
+  scale_fill_manual(values = c("darkred", "darkgreen", "darkblue")) +
+  guides(fill = guide_legend(order = 1), color = guide_legend(order = 2)) +
+  scale_x_continuous(limits = c(-0.5, 45)) +
+  theme(axis.line.x.bottom = element_line(color = "black"),
+        axis.line.y.left = element_line(color = "black"))
+
+p_septum_genetic
+
+
+cmh_data %>%
+  filter(new_gene_dx %in% c("Genética Positiva", "Genética Negativa")) %>%
+  select(nome_do_paciente, septo_geral, genetic_group) %>%
+  melt(id.vars = c("nome_do_paciente", "genetic_group")) %>%
+  drop_na(value) %>%
+  ggplot() +
+  geom_density(aes(x = value, fill = genetic_group), alpha = 0.65, color = NA) +
+  geom_vline(aes(color = "corte_diagnostico", xintercept = 13.0), size = 0.8, linetype = "dashed", show.legend = TRUE) +
+  scale_fill_discrete(labels = c("Genética Positiva", "Genética Negativa")) +
+  labs(x = "Diameter (mm)", y = "", fill = "Grupo Genético", color = "", title = "LV Wall Thickness by Genetic Group", subtitle = "") +
+  scale_color_manual(labels = c("Diagnostic Cutoff (13mm)"), values = c("darkred")) +
+  scale_fill_manual(values = c("darkred", "darkblue")) +
+  guides(fill = guide_legend(order = 1), color = guide_legend(order = 2)) +
+  scale_x_continuous(limits = c(-0.5, 45)) +
+  theme(axis.line.x.bottom = element_line(color = "black"),
+        axis.line.y.left = element_line(color = "black"))
+
+
+ggsave("septum_imaging.png", dpi = 300, width = 10, height = 8)
+
+p_septum_genetic / p_septum_criterio
+
+p_septum_by_diagnosis <- cmh_data %>%
+  select(nome_do_paciente, septo_geral, new_gene_dx) %>%
+  melt(id.vars = c("nome_do_paciente")) %>%
+  mutate(variable = fct_case_when(
+    variable == "GEN POSITIVO" ~ "Positive Genotype",
+    variable == "GEN NEGATIVO" ~ "Negative Genotype"
+  )) %>%
+  drop_na(value) %>%
+  ggplot() +
+  geom_density(aes(x = value, fill = variable), alpha = 0.65, color = "black", color = NA) +
+  geom_vline(aes(color = "corte_diagnostico", xintercept = 13.0), size = 0.8, linetype = "dashed", show.legend = TRUE) +
+  scale_fill_discrete(labels = c("Positive Genotype", "Negative Genotype")) +
+  labs(x = "Diameter (mm)", y = "", fill = "Genetic Diagnosis", color = "", title = "LV Wall Thickness by Genetic Diagnosis", subtitle = "") +
+  scale_color_manual(labels = c("Diagnostic Cutoff (13 mm)"), values = c("darkgray")) +
+  scale_fill_manual(values = c("#901C22", "#183663")) +
+  guides(fill = guide_legend(order = 1), color = guide_legend(order = 2)) +
+  scale_x_continuous(limits = c(-0.5, 45)) +
+  theme(axis.line.x.bottom=element_line(color="black"),
+        axis.line.y.left=element_line(color="black"))
+
+ggsave("septum_diagnosis.png", dpi = 300, width = 10, height = 8)
+
+
+p_septum_by_modality <- cmh_data %>%
+  select(nome_do_paciente, septo, septo_ress) %>%
+  melt(id.vars = c("nome_do_paciente")) %>%
+  mutate(variable = fct_case_when(
+    variable == "septo" ~ "Echocardiography",
+    variable == "septo_ress" ~ "Cardiac MRI"
+  )) %>%
+  drop_na(value) %>%
+  ggplot() +
+  geom_density(aes(x = value, fill = variable), alpha = 0.65, color = "black", color = NA) +
+  geom_vline(aes(color = "corte_diagnostico", xintercept = 13.0), size = 0.8, linetype = "dashed", show.legend = TRUE) +
+  scale_fill_discrete(labels = c("Echocardiography", "Cardiac MRI")) +
+  labs(x = "Diâmetro (mm)", y = "", fill = "Imaging Modality", color = "", title = "LV Wall Thickness by Imaging Modality", subtitle = "") +
+  scale_color_manual(labels = c("Diagnostic Cutoff (13 mm)"), values = c("darkgray")) +
+  scale_fill_manual(values = c("#901C22", "#183663")) +
+  guides(fill = guide_legend(order = 1), color = guide_legend(order = 2)) +
+  scale_x_continuous(limits = c(-0.5, 45)) +
+  theme(axis.line.x.bottom=element_line(color="black"),
+        axis.line.y.left=element_line(color="black"))
+
+ggsave("septum_modality.png", dpi = 300, width = 10, height = 8)
+
+p_septum_by_modality
+
+```
+
+```{r}
+# Para o primeiro gráfico
+cmh_data %>%
+  ggplot(aes(
+    x = factor(genetic_group, levels = c("Genética Positiva", "VUS", "Genética Negativa")), 
+    y = septo_geral,
+    fill = genetic_group)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("Genética Positiva" = "darkblue", 
+                               "VUS" = "darkgreen", 
+                               "Genética Negativa" = "darkred")) +
+  labs(x = "Grupo Genético", y = "Tamanho do Septo (mm)", fill = "Grupo Genético") +
+  theme_minimal()
+
+# Para o segundo gráfico
+cmh_data %>%
+  ggplot(aes(
+    x = factor(new_vus, levels = c("Genética Positiva", "VUS", "Genética Negativa")), 
+    y = septo_geral,
+    fill = genetic_group)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("Genética Positiva" = "darkblue", 
+                               "VUS" = "darkgreen", 
+                               "Genética Negativa" = "darkred")) +
+  labs(x = "Grupo Genético", y = "Tamanho do Septo (mm)", fill = "Grupo Genético") +
+  theme_minimal()
+ggsave("septum_imaging.png", dpi = 300, width = 10, height = 8)
+```
+
+#GRÁFICO ARVORE (TIPO FAIXA ETÁRIA +\|-)
+
+```{r}
+library(pROC)
+
+# Get the predicted values from the model
+predicted_values <- predict(full_model)
+
+# Calculate the ROC curve using pROC
+roc_curve <- roc(response = regression_data$genetic_group, predictor = predicted_values)
+
+# Extract the data for the ROC curve
+roc_data <- data.frame(
+  specificity = rev(roc_curve$specificities),  # x-axis (1 - specificity)
+  sensitivity = rev(roc_curve$sensitivities)   # y-axis (sensitivity)
+)
+
+auc_value = auc(roc_curve)
+
+# Plot the ROC curve using ggplot2
+ggplot(roc_data, aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(color = "blue", size = 1) +  # Line for the ROC curve
+  geom_abline(linetype = "dashed", color = "red") +  # Diagonal line (random model)
+  labs(
+    title = "ROC Curve",
+    x = "1 - Specificity",
+    y = "Sensitivity"
+  ) +
+  geom_text(x = 0.1, y = 1.0, label = paste("AUC =", round(auc_value, 2)), color = "blue", size = 5) +
+  theme_minimal()
+```
+
+```{r}
+df2 <- df2 %>%
+  mutate(idade2 = cut(idade,
+                           breaks = c(seq(0, 80, by = 5), Inf),
+                           labels = c("0-4 anos", "5-9 anos", "10-14 anos", "15-19 anos", 
+                                      "20-24 anos", "25-29 anos", "30-34 anos", "35-39 anos", 
+                                      "40-44 anos", "45-49 anos", "50-54 anos", "55-59 anos", 
+                                      "60-64 anos", "65-69 anos", "70-74 anos", "75-79 anos", 
+                                      "80 anos ou mais"),
+                           right = FALSE))  # Intervalo fechado à esquerda
+
+# Passo 2: Calcular a média de septo_geral por faixa etária e sexo
+dados_grafico <- df2 %>%
+  group_by(idade2, sexo) %>%
+  summarise(TamanhoMedio = mean(septo_geral, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(TamanhoMedio = ifelse(sexo == "Masculino", -TamanhoMedio, TamanhoMedio))
+
+# Passo 3: Criar o gráfico
+ggplot(dados_grafico, aes(x = TamanhoMedio, y = idade2, fill = sexo)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("Masculino" = "darkblue", "Feminino" = "red")) +
+  scale_x_continuous(labels = abs, name = "Tamanho Médio do Septo (mm)") +
+  labs(title = "Pirâmide Etária com Tamanho Médio do Septo", y = "Faixa Etária") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+library(dplyr)
+library(janitor)
+library(gtsummary)
+library(flextable)
+library(officer)
+
+############################## 49 DO MENOR
+tabela_sociomenor <- cmh_menor %>%
+  select(origin, idade:renda, consaguinidade_parental:amiodarona, portador_de_cdi:acroparestesias, genetic_group) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `Genetic Group`,
+                         statistic = list(
+                           all_continuous() ~ "{mean} ({sd}))",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing_text = "Desconhecido") %>%
+  add_overall() %>%
+  add_p()
+
+# Converter a tabela gtsummary em uma flextable para ajustar o layout no Word
+tabela_flex <- as_flex_table(tabela_sociomenor)
+
+# Ajustar a largura das colunas para caber no documento
+tabela_flex <- tabela_flex %>%
+  autofit() %>%
+  set_table_properties(width = 1, layout = "autofit")  # Ajusta a tabela para a página
+
+# Salvar a tabela em um documento Word
+doc <- read_docx() %>%
+  body_add_flextable(tabela_flex)
+
+print(doc, target = "tabela_socioMENOR.docx")
+
+
+######################################## GERAL
+tabela_socio <- cmh_data %>%
+  select(origin, idade:renda, consaguinidade_parental:amiodarona, portador_de_cdi:acroparestesias, genetic_group) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `Genetic Group`,
+                         statistic = list(
+                           all_continuous() ~ "{mean} ({sd}))",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing_text = "Desconhecido") %>%
+  add_overall() %>%
+  add_p()
+
+# Converter a tabela gtsummary em uma flextable para ajustar o layout no Word
+tabela_flex <- as_flex_table(tabela_socio)
+
+# Ajustar a largura das colunas para caber no documento
+tabela_flex <- tabela_flex %>%
+  autofit() %>%
+  set_table_properties(width = 1, layout = "autofit")  # Ajusta a tabela para a página
+
+# Salvar a tabela em um documento Word
+doc <- read_docx() %>%
+  body_add_flextable(tabela_flex)
+
+print(doc, target = "tabela_socio.docx")
+
+############################## 70
+tabela_socioexc <- cmh_exclusao %>%
+  select(origin, idade:renda, consaguinidade_parental:amiodarona, portador_de_cdi:acroparestesias, genetic_group) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `Genetic Group`,
+                         statistic = list(
+                           all_continuous() ~ "{mean} ({sd}))",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing_text = "Desconhecido") %>%
+  add_overall() %>%
+  add_p()
+
+# Converter a tabela gtsummary em uma flextable para ajustar o layout no Word
+tabela_flex <- as_flex_table(tabela_socioexc)
+
+# Ajustar a largura das colunas para caber no documento
+tabela_flex <- tabela_flex %>%
+  autofit() %>%
+  set_table_properties(width = 1, layout = "autofit")  # Ajusta a tabela para a página
+
+# Salvar a tabela em um documento Word
+doc <- read_docx() %>%
+  body_add_flextable(tabela_flex)
+
+print(doc, target = "tabela_socioEXCLUDE.docx")
+
+############################## 130
+tabela_socioCRITERIO <- df2 %>%
+  select(origin, idade:renda, consaguinidade_parental:amiodarona, portador_de_cdi:acroparestesias, genetic_group) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `Genetic Group`,
+                         statistic = list(
+                           all_continuous() ~ "{mean} ({sd}))",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing_text = "Desconhecido") %>%
+  add_overall() %>%
+  add_p()
+
+# Converter a tabela gtsummary em uma flextable para ajustar o layout no Word
+tabela_flex <- as_flex_table(tabela_socioCRITERIO)
+
+# Ajustar a largura das colunas para caber no documento
+tabela_flex <- tabela_flex %>%
+  autofit() %>%
+  set_table_properties(width = 1, layout = "autofit")  # Ajusta a tabela para a página
+
+# Salvar a tabela em um documento Word
+doc <- read_docx() %>%
+  body_add_flextable(tabela_flex)
+
+print(doc, target = "tabela_socioCRITERIO.docx")
+
+```
+
+
+#TABELAS EXCLUD
+```{r}
+cmh_menor <- subset(cmh_data, septo_geral < 13)
+cmh_exclusao <- subset(cmh_data, septo_geral < 13 | is.na(septo_geral))
+cmh_maior <- subset(cmh_data, septo_geral < 13 | is.na(septo_geral))
+```
+
+#Manipulação das variáveis
+
+```{r}
+cmh_newdata <- cmh_data %>%
+  mutate(
+    gene_group = case_when(
+      genetic_group == "Genética Positiva" & gene_number_1 == "MYH7" ~ "MYH7",
+      genetic_group == "Genética Positiva" & gene_number_1 == "MYBPC3" ~ "MYBPC3",
+      genetic_group == "Genética Positiva" ~ "Outros Genes",
+      genetic_group == "Genética Negativa" ~ "Genética Negativa",
+      genetic_group == "VUS" ~ "VUS"
+    ) %>% as_factor(),
+    origin = case_when(
+      grepl("aracaju", tolower(procedencia), fixed = TRUE) ~ "Capital",
+      TRUE ~ "Interior"
+    ) %>% as_factor()
+  )
+
+
+cmh_data <- cmh_data %>%
+  mutate(
+    new_vus = case_when(
+      new_gene_dx == 'GEN POSITIVO' ~ 'Genética Positiva',
+      vus_count > 0 & new_gene_dx == 'GEN NEGATIVO' ~ 'VUS',
+      vus_count == 0 & new_gene_dx == 'GEN NEGATIVO' ~ 'Genética Negativa'  
+    ) %>% as_factor()
+  )
+
+df2 <- df2 %>%
+  mutate(
+    new_vus = case_when(
+      new_gene_dx == 'GEN POSITIVO' ~ 'Genética Positiva',
+      vus_count > 0 & new_gene_dx == 'GEN NEGATIVO' ~ 'VUS',
+      vus_count == 0 & new_gene_dx == 'GEN NEGATIVO' ~ 'Genética Negativa'  
+    ) %>% as_factor()
+  )
+
+#WILLIAN
+cmh_data <- cmh_data %>%
+  mutate(
+    vus_willian = case_when(
+      vus_count > 0 & new_gene_dx == 'GEN POSITIVO' ~ 'P/LP COM VUS',
+      vus_count == 0 & new_gene_dx == 'GEN POSITIVO' ~ 'P/LP SEM VUS',
+      vus_count > 0 & new_gene_dx == 'GEN NEGATIVO' ~ 'APENAS VUS',
+      vus_count == 0 & new_gene_dx == 'GEN NEGATIVO' ~ 'ALL NEG'  
+    ) %>% as_factor()
+  )
+
+df2 <- df2 %>%
+  mutate(
+    vus_willian = case_when(
+      vus_count > 0 & new_gene_dx == 'GEN POSITIVO' ~ 'P/LP COM VUS',
+      vus_count == 0 & new_gene_dx == 'GEN POSITIVO' ~ 'P/LP SEM VUS',
+      vus_count > 0 & new_gene_dx == 'GEN NEGATIVO' ~ 'APENAS VUS',
+      vus_count == 0 & new_gene_dx == 'GEN NEGATIVO' ~ 'ALL NEG'  
+    ) %>% as_factor()
+  )
+
+```
+
+#GRAFICO
+
+```{r}
+cmh_data %>%
+  select(nome_do_paciente, septo, septo_ress) %>%
+  melt(id.vars = c("nome_do_paciente")) %>%
+  mutate(variable = fct_case_when(
+    variable == "septo" ~ "Ecocardiograma",
+    variable == "septo_ress" ~ "RNM Cardíaca"
+  )) %>%
+  drop_na(value) %>%
+  ggplot() +
+  geom_density(aes(x = value, fill = variable), alpha = 0.65, color = "black", color = NA) +
+  geom_vline(aes(color = "corte_diagnostico", xintercept = 13.0), size = 0.8, linetype = "dashed", show.legend = TRUE) +
+  scale_fill_discrete(labels = c("Echocardiography", "Magnetic Resonance Imaging")) +
+  labs(x = "Diâmetro (mm)", y = "", fill = "Modalidade", color = "", title = "LV Wall Thickness by Imaging Modality", subtitle = "") +
+  scale_color_manual(labels = c("ESC LV Wall Thickness Criterion (13 mm)"), values = c("darkgray")) +
+  scale_fill_manual(values = c("#901C22", "#183663")) +
+  guides(fill = guide_legend(order = 1), color = guide_legend(order = 2)) +
+  scale_x_continuous(limits = c(-0.5, 45)) +
+  theme(axis.line.x.bottom=element_line(color="black"),
+        axis.line.y.left=element_line(color="black"))
+
+# Salvar a imagem em alta resolução
+ggsave("grafico_lv_wall_thickness.png", dpi = 300, width = 10, height = 8)
+
+
+
+p_septum_by_diagnosis <- df %>%
+  select(septo_geral, true_genetic_hcm) %>%
+  drop_na() %>%
+  ggplot() +
+  geom_density(aes(x = septo_geral, fill = true_genetic_hcm), alpha = 0.65, color = "black", color = NA) +
+  geom_vline(aes(color = "corte_diagnostico", xintercept = 15.0), size = 0.8, linetype = "dashed", show.legend = TRUE) +
+  #scale_fill_discrete(labels = c("HCM Genético", "HCM Não Genética")) +
+  labs(x = "Diâmetro (mm)", y = "", fill = "Diagnóstico", color = "", title = "LV Wall Thickness by Genetic Diagnostic", subtitle = "") +
+  scale_color_manual(labels = c("Corte Diagnóstico (15 mm)"), values = c("darkgray")) +
+  scale_fill_manual(values = c("#901C22", "#183663")) +
+  guides(fill = guide_legend(order = 1), color = guide_legend(order = 2)) +
+  scale_x_continuous(limits = c(-0.5, 45)) +
+  theme(axis.line.x.bottom=element_line(color="black"),
+        axis.line.y.left=element_line(color="black"))
+#ggsave("septum_imaging.png", device = "png", width = 800, height = 450, units = "px", dpi = 72)
+ggsave("septum_imaging.png", dpi = 300, width = 10, height = 8)
+
+p_septum_by_modality / p_septum_by_diagnosis
+
+```
+
+```{r}
+library(tidyr)
+library(ggplot2)
+library(dplyr)
+# Suponha que você queira contar os valores únicos na coluna 'coluna_desejada' de df2
+# Suponha que você queira contar a frequência dos valores na coluna 'coluna_desejada' de df2
+sort(table(df2$gene_number_1), decreasing = TRUE)
+
+
+```
+
+#BUSCAR DADO
+```{r}
+
+cmh_data %>%
+  filter(gene_number_1 == "MYH7") %>%
+  #select(septo_geral)
+  count(gene_number_1)
+
+cmh_data %>%
+  filter(is_ttr == "TTR", septo_geral < 13) %>%
+ # summarise(total = n_distinct(id_da_familia)) %>%
+#  pull(total)
+  select(nome_do_paciente, sexo, idade, septo_geral)
+
+cmh_data %>%
+  filter(new_gene_dx == "GEN POSITIVO") %>%
+  select(nome_do_paciente, gene_number_1) %>%
+  arrange(gene_number_1) %>%  # Ordena por 'gene_number_1' em ordem alfabética
+  flextable() %>%
+  autofit() %>%
+  {
+    tabela <- . # Captura a tabela flextable criada no pipe
+    read_docx() %>%
+      body_add_par("Tabela de Genes Positivos", style = "heading 1") %>%
+      body_add_flextable(value = tabela) %>%  # Especifica explicitamente o argumento "value"
+      print(target = "tabela_genes_positivos.docx")
+  }
+
+
+```
+
+```{r}
+
+cmh_data %>%
+  filter(!is.na(imc_strat)) %>% # Filtra valores não ausentes
+  ggplot(aes(x = imc_strat)) +
+  geom_bar(fill = "darkblue", width = 0.6) + # Gráfico de barras com frequência absoluta
+  geom_text(
+    stat = "count",
+    aes(
+      label = paste0(..count.., " (", round(..count.. / sum(..count..) * 100, 1), "%)"), # Frequência absoluta (relativa %)
+      y = ..count..
+    ),
+    vjust = -0.5, # Posiciona os rótulos acima das barras
+    size = 3.5 # Ajusta o tamanho do texto
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.2)) # Adiciona 20% de margem superior
+  ) +
+  labs(
+    title = "Distribuição da População por IMC",
+    x = "Faixas de IMC",
+    y = "Frequência Absoluta"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 40, hjust = 1), # Rotacionar as legendas do eixo X
+    axis.title.y = element_text(margin = margin(r = 15)), # Afastar o título do eixo Y
+    plot.title = element_text(hjust = 0.5, margin = margin(b = 20)), # Centralizar e adicionar margem inferior ao título
+    plot.margin = margin(t = 30, r = 10, b = 40, l = 10) # Aumentar a margem superior e inferior para evitar corte
+  )
+
+
+```
+
+```{r}
+
+cmh_data %>%
+  filter(
+    !is.na(gene_number_1) & 
+    gene_number_1 %in% c("ACTC1", "FLNC", "LAMP2", "MYL2", "TNNI3", "CSRP3", 
+                           "MYBPC3", "MYL3", "TNNT2", "DES", "JPH2", "MYH7", 
+                           "PLN", "TNNC1", "TPM1", "GLA", "TTR", "LAMP2", "PTPN11")
+  ) %>% 
+  ggplot(aes(x = gene_number_1)) +
+  geom_bar(aes(y = ..prop.., group = 1), fill = "steelblue", width = 0.65) + # Gráfico de barras
+  geom_text(
+    stat = "count",
+    aes(label = ..count.., y = ..count../sum(..count..)), # Adiciona rótulos de valores absolutos
+    vjust = -0.5 # Posiciona os rótulos acima das barras
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1), # Mostra frequências relativas em porcentagem
+    expand = expansion(mult = c(0, 0.2)) # Adiciona 20% de margem superior
+  ) +
+  labs(
+    title = " ",
+    x = "Genes",
+    y = "Frequência Relativa (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 40, hjust = 1), # Rotacionar as legendas do eixo X
+    axis.title.y = element_text(margin = margin(r = 15)), # Afastar o título do eixo Y
+    plot.title = element_text(hjust = 0.5, margin = margin(b = 20)), # Centralizar e adicionar margem inferior ao título
+    plot.margin = margin(t = 30, r = 10, b = 40, l = 10) # Aumentar a margem superior e inferior para evitar corte
+  ) 
+
+
+cmh_data <- cmh_data %>%
+  mutate(
+    new_dx_gen = case_when(
+      gene_number_1 %in% c("ACTC1", "FLNC", "LAMP2", "MYL2", "TNNI3", "CSRP3", 
+                           "MYBPC3", "MYL3", "TNNT2", "DES", "JPH2", "MYH7", 
+                           "PLN", "TNNC1", "TPM1") ~ "HCM Sarcomerica",
+      gene_number_1 %in% c("GLA", "TTR", "LAMP2", "PRKAG2", "PTPN11") ~ "HCM Fenocopia",
+      !is.na(gene_number_1) & vus_count != 0 ~ "HCM VUS",
+      TRUE ~ "HCM Nao Genetica"
+    )
+  )
+
+df2 <- df2 %>%
+  mutate(
+    new_dx_gen = case_when(
+      gene_number_1 %in% c("ACTC1", "FLNC", "LAMP2", "MYL2", "TNNI3", "CSRP3", 
+                           "MYBPC3", "MYL3", "TNNT2", "DES", "JPH2", "MYH7", 
+                           "PLN", "TNNC1", "TPM1") ~ "HCM Sarcomerica",
+      gene_number_1 %in% c("GLA", "TTR", "LAMP2", "PRKAG2", "PTPN11") ~ "HCM Fenocopia",
+      !is.na(gene_number_1) & vus_count > 0 ~ "HCM VUS",
+      TRUE ~ "HCM Nao Genetica"
+    )
+  )
+
+# 1-agl
+# 1-alms1
+# 2-alpk3
+# 1-dsp
+# 1-slc22as
+# 1-tmem70
+
+df2 %>%
+  filter(gene_number_1 == "TTR") %>%
+  select(nome_do_paciente)
+
+
+```
+
+```{r}
+df2 %>%
+  select(septo_geral, genetic_group) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `Genetic Group`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         #sort = everything() ~ "alphanumeric",
+                         missing_text = "Desconhecido") %>%
+  add_p() %>%
+  add_overall() %>%
+  table_to_docx(.) %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped", "scale_down"))
+
+library(gtsummary)
+library(kableExtra)
+library(janitor)
+library(dplyr)
+library(webshot)
+
+df2 %>%
+  filter(gene_number_1 == "TTR") %>%
+  select(septo_geral, sexo, idade, gene_number_1) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `Gene Number 1`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing_text = "Desconhecido") %>%
+  add_p() %>%
+  add_overall() %>%
+  table_to_docx(.) %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped", "scale_down")) %>%
+  # Salvar diretamente em HTML para conversão
+  save_kable("C:/Users/leolv/Downloads/grafianov/tabela.html")
+
+# Agora converte o HTML para uma imagem PNG de alta resolução
+webshot::webshot(
+  url = "C:/Users/leolv/Downloads/grafianov/tabela.html", 
+  file = "C:/Users/leolv/Downloads/grafianov/tabela.png", 
+  zoom = 2  # Para aumentar a resolução da imagem
+)
+
+
+```
+
+```{r}
+library(tidyr)
+library(ggplot2)
+library(dplyr)
+
+# Criar o gráfico
+ggplot(
+  df2 %>%
+    # mutate(gene_group = case_when(
+    #  genetic_group == "Genética Positiva" & gene_number_1 == "MYH7" ~ "MYH7",
+    #  genetic_group == "Genética Positiva" & gene_number_1 == "MYBPC3" ~ "MYBPC3",
+    #  genetic_group == "Genética Positiva" ~ "Outros genes",
+    #  genetic_group == "Genética Negativa" ~ "Genética Negativa",
+    #  genetic_group == "VUS" ~ "VUS",
+    #  TRUE ~ NA_character_)) %>%
+    count(genetic_group, probando) %>%
+    complete(genetic_group, probando = c("Sim", "Não"), fill = list(n = 0)) %>%
+    group_by(genetic_group) %>%
+    summarise(
+      total = sum(n),
+      n_sim = n[probando == "Sim"],
+      n_nao = n[probando == "Não"],
+      porcentagem_sim = (n_sim / total) * 100,
+      label = ifelse(n_sim > 0, paste0(round(porcentagem_sim, 1), "% (n=", n_sim, ")"), "")  # Condicional para não mostrar rótulo se n_sim for 0
+    ) %>%
+    filter(total > 0)  # Excluir grupos com total igual a zero
+) +
+  geom_bar(aes(x = reorder(gene_group, -porcentagem_sim), y = porcentagem_sim, fill = "Pacientes Sim"), stat = "identity", width = 0.5) +
+  geom_text(aes(x = reorder(gene_group, -porcentagem_sim), y = porcentagem_sim, label = label), vjust = -0.5, size = 4) +  # Diminuir o tamanho da legenda
+  labs(x = "Grupo de Genes", y = "Frequência Relativa", title = "") +
+  scale_fill_manual(values = c("Pacientes Sim" = "darkblue")) +
+  ylim(0, 100) +  # Define o limite do eixo Y até 100
+  theme_minimal() +
+  theme(
+    axis.title.x = element_text(margin = margin(t = 15), size = 14),
+    axis.title.y = element_text(margin = margin(r = 15), size = 14),
+    axis.text.x = element_text(size = 12, face = "bold"),
+    plot.margin = margin(t = 40, r = 20, b = 20, l = 20),
+    plot.title = element_text(hjust = 0.5, size = 18, margin = margin(t = 20)),
+    legend.position = "none"
+  )
+
+# Salvar o gráfico
+ggsave(filename = "tabela_sim_gene.png", width = 9, height = 8, dpi = 300)
+
+
+```
+
+```{r}
+df2 %>%
+  select(nome_do_paciente, septo_ress, septo) %>%
+  melt(id.vars = c("nome_do_paciente")) %>%
+  mutate(variable = fct_case_when(
+    variable == "septo" ~ "Ecocardiograma",
+    variable == "septo_ress" ~ "RNM"
+  )) %>%
+  drop_na(value) %>%
+  ggplot() +
+  geom_density(aes(x = value, fill = variable), alpha = 0.65, color = NA) +  # Removi a segunda referência a color = "black"
+  geom_vline(aes(color = "corte_diagnostico", xintercept = 13.0), size = 0.8, linetype = "dashed", show.legend = TRUE) +
+  scale_fill_discrete(labels = c("Ecocardiograma", "RNM Cardíaca")) +
+  labs(x = "Diâmetro (mm)", y = "", fill = "Modalidade", color = "", title = "LV Wall Thickness by Imaging Modality", subtitle = "") +
+  scale_color_manual(labels = c("Corte Diagnóstico (15 mm)"), values = c("darkgray")) +
+  scale_fill_manual(values = c("#901C22", "#183663")) +
+  guides(fill = guide_legend(order = 1), color = guide_legend(order = 2)) +
+  scale_x_continuous(limits = c(-0.5, 45)) +
+  theme(axis.line.x.bottom = element_line(color = "black"),
+        axis.line.y.left = element_line(color = "black"))
+
+```
+
+#Salvando nova
+
+```{r}
+write.csv(df2, "C:/Users/leolv/Downloads/cmh_atual.csv", row.names = TRUE)
+```
+
+#Obstrução e gradiente
+
+```{r}
+#GRADIENTE
+df2 <- df2 %>%
+  mutate(gradiente_novo = case_when(
+    nome_do_paciente == "Márcia Freitas Alves" ~ 30,
+    TRUE ~ gradiente_novo
+  ))
+
+
+```
+
+#Verificação
+
+```{r}
+
+df2 <- df2 %>%
+  mutate(
+    verificado_obstrucao = case_when(
+      !is.na(gradiente_maximo_total) | !is.na(obstrucao_novo) ~ "Sim",
+      TRUE ~ "Não"
+    ) %>% as_factor()  # Se você quiser que seja um fator
+  )
+
+# Imprimir as linhas onde verificado_obstrucao é "Não"
+cmh_data %>%
+  filter(septo_geral == "12") %>%
+  select(nome_do_paciente, gene_number_1) %>%
+  print()
+
+
+```
+
+```{r}
+
+cmh_data %>%
+  group_by(gene_number_1) %>%
+  summarize(mediana_septo = median(septo_geral)) %>%
+  ggplot(aes(x = gene_number_1, y = mediana_septo, fill = gene_number_1)) +
+  geom_bar(stat = "identity", width = 0.7) + # Reduzir largura das barras para criar espaço
+  geom_text(aes(label = round(mediana_septo, 1)), 
+            vjust = -0.5, size = 4) + # Adição dos valores absolutos acima das barras
+  scale_fill_viridis_d() +
+  labs(
+    title = "Mediana de Septo Geral por Gene Number 1",
+    x = "Gene Number 1",
+    y = "Mediana de Septo Geral"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    axis.text.x = element_text(angle = 45, hjust = 1), # Rotação do texto no eixo X
+    panel.grid.major.x = element_blank() # Remover linhas de grade verticais
+  )
+
+
+
+```
+
+#TTR 
+
+```{r}
+
+cmh_data %>%
+  filter(ttr_novo %in% c("SARCOMERIC", "TTR")) %>%
+  mutate(ttr_novo = fct_relevel(ttr_novo, "SARCOMERIC", "TTR")) %>%
+  select(septo, idade, ttr_novo) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `Ttr Novo`,
+                         statistic = list(
+                           all_continuous() ~ "{mean} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing = "no") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+
+```
+
+#CURVA ROC
+```{r}
+resultado_modelo <- cmh_data %>%
+  # Criar variáveis binárias diretamente na pipe
+  mutate(
+    morte_subita_bin = ifelse(historico_de_morte_subita == "Sim", 1, 0),
+    septo_bin = ifelse(septo_geral > 17, 1, 0),
+    gene_positivo_bin = ifelse(new_gene_dx == "GEN POSITIVO", 1, 0)
+  ) %>%
+  # Ajustar o modelo logístico
+  { glm(gene_positivo_bin ~ morte_subita_bin + septo_bin, data = ., family = "binomial") } %>%
+  # Extrair resultados do modelo
+  broom::tidy(conf.int = TRUE, exponentiate = TRUE)
+
+# Visualizar os resultados
+resultado_modelo
+
+library(tidyverse)
+
+cmh_data <- cmh_data %>%
+  mutate(
+    septo_bin = if_else(septo_geral > 17, 1, 0),
+    morte_subita_bin = if_else(historico_de_morte_subita == "Sim", 1, 0),
+    gen_pos = if_else(new_gene_dx == "GEN POSITIVO", 1, 0)
+  )
+
+modelo_interacao <- glm(
+  gen_pos ~ morte_subita_bin * septo_bin,
+  family = binomial,
+  data = cmh_data
+)
+
+summary(modelo_interacao)
+
+
+cmh_data_completo <- cmh_data %>% drop_na(septo_geral, historico_de_morte_subita, new_gene_dx)
+modelo_interacao_completo <- glm(
+  gen_pos ~ morte_subita_bin * septo_bin,
+  family = binomial,
+  data = cmh_data_completo
+)
+
+# Gerar predições de probabilidade
+probabilidades_completo <- predict(modelo_interacao_completo, type = "response")
+
+# Gerar a Curva ROC
+roc_curve <- roc(cmh_data_completo$gen_pos, probabilidades_completo)
+
+plot(roc_curve, main = "Curva ROC - Modelo de Interação", col = "blue", xlim = c(0, 1), ylim = c(0, 1))
+
+
+
+```
+
+
+```{r}
+
+
+cmh_data %>%
+  select(septo_geral, septo, septo_ress, new_vus) %>%
+  janitor::clean_names(case = "title") %>%
+  gtsummary::tbl_summary(., 
+                         by = `New Vus`,
+                         statistic = list(
+                           all_continuous() ~ "{median} ({p25} a {p75})",
+                           all_categorical() ~ "{n} ({p}%)"
+                         ),
+                         missing = "no") %>%
+  add_overall() %>%
+  add_p() %>%
+  table_to_docx() %>%
+  as_kable_extra(longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = c("striped","scale_down"))
+
+```
+
+
+#CONTAR VUS
+```{r}
+
+cmh_data %>%
+  pull(vus) %>%                 # Extrai a coluna 'vus' como vetor
+  strsplit(split = "[.;]") %>%  # Divide os valores por '.' ou ';'
+  unlist() %>%                  # Concatena todos os valores em um vetor
+  trimws() %>%                  # Remove espaços em branco extras
+  table() %>%                   # Cria uma tabela de frequência
+  as.data.frame() %>%           # Converte a tabela para um dataframe
+  rename(VUS = ".", Frequencia = "Freq") %>% # Renomeia as colunas
+  arrange(desc(Frequencia))     
+
+cmh_data %>%
+  pull(vus) %>%                 # Extrai a coluna 'vus' como vetor
+  strsplit(split = "[.;]") %>%  # Divide os valores por '.' ou ';'
+  unlist() %>%                  # Concatena todos os valores em um vetor
+  trimws() %>%                  # Remove espaços em branco extras
+  table() %>%                   # Cria uma tabela de frequência
+  as.data.frame() %>%           # Converte a tabela para um dataframe
+  rename(VUS = ".", Frequencia = "Freq") %>% # Renomeia as colunas
+  arrange(VUS)                  # Ordena os dados por ordem alfabética
+
+
+```
+
+
+
+#Cleaning
+
+```{r}
+rm(quantidade_unicos)
+```
+
+#Salvando nova
+
+```{r}
+write.csv(df2, "C:/Users/leolv/Downloads/cmh_atual.csv", row.names = TRUE)
+readr::write_csv(cmh_data, stringr::str_interp("${FILE_NAME}_processed.csv"))
+
+cmh_data
+```
